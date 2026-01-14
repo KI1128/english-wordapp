@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-import sqlite3
 import random
 from datetime import datetime
 
@@ -35,160 +35,114 @@ DB_PATH = APP_DIR / "progress.db"
 # =============================
 # DB
 # =============================
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
-
-
-def init_db() -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # 単語スコア（mode=1..5）
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS word_scores (
-            level TEXT NOT NULL,
-            headword TEXT NOT NULL,
-            mode INTEGER NOT NULL,
-            score INTEGER NOT NULL,      -- 0/5/10 or 初期1
-            attempts INTEGER NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (level, headword, mode)
-        )
-        """
-    )
-
-    # 文法「読んだ！」管理
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS grammar_reads (
-            level TEXT NOT NULL,
-            name TEXT NOT NULL,
-            read_count INTEGER NOT NULL,
-            last_read_at TEXT NOT NULL,
-            PRIMARY KEY (level, name)
-        )
-        """
-    )
-
-    conn.commit()
-    conn.close()
-
-
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
-
 def get_word_mode_score(level: str, headword: str, mode: int) -> tuple[int, int]:
-    """(score, attempts) / 無ければ初期(1,0)"""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT score, attempts FROM word_scores WHERE level=? AND headword=? AND mode=?",
-        (level, headword, mode),
-    )
-    row = cur.fetchone()
-    conn.close()
-    if row is None:
+    """
+    (score, attempts)
+    未挑戦は仕様どおり score=1, attempts=0
+    """
+    ensure_progress()
+    key = f"{level}|{headword}|{mode}"
+    rec = st.session_state.progress["word_scores"].get(key)
+    if rec is None:
         return (1, 0)
-    return (int(row[0]), int(row[1]))
+    return (int(rec.get("score", 1)), int(rec.get("attempts", 0)))
 
 
 def set_word_mode_score(level: str, headword: str, mode: int, score: int) -> None:
+    ensure_progress()
+    key = f"{level}|{headword}|{mode}"
     prev_score, prev_attempts = get_word_mode_score(level, headword, mode)
-    attempts = prev_attempts + 1
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO word_scores(level, headword, mode, score, attempts, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(level, headword, mode)
-        DO UPDATE SET score=excluded.score, attempts=excluded.attempts, updated_at=excluded.updated_at
-        """,
-        (level, headword, mode, int(score), int(attempts), now_iso()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_word_total_score(level: str, headword: str) -> int:
-    # mode 1..5（無いものは1）
-    total = 0
-    for m in range(1, 6):
-        s, _ = get_word_mode_score(level, headword, m)
-        total += s
-    return total
+    st.session_state.progress["word_scores"][key] = {
+        "score": int(score),
+        "attempts": int(prev_attempts + 1),
+        "updated_at": now_iso(),
+    }
 
 
 def get_all_word_totals(level: str, headwords: list[str]) -> dict[str, int]:
     """
-    DBからまとめて取得（存在しないmodeは1扱い）
+    各単語の「5指標合計」を返す。
+    未挑戦は各mode=1なので合計5。
     """
-    # 初期値は5（1×5）
+    ensure_progress()
     totals = {hw: 5 for hw in headwords}
 
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT headword, mode, score
-        FROM word_scores
-        WHERE level=? 
-        """,
-        (level,),
-    )
-    rows = cur.fetchall()
-    conn.close()
+    # ある分だけ (score-1) を足す（初期1は既に合計5に含めているため）
+    for key, rec in st.session_state.progress["word_scores"].items():
+        try:
+            lvl, hw, mode_s = key.split("|", 2)
+            mode = int(mode_s)
+        except Exception:
+            continue
 
-    # まず全部 1×5 としておいて、存在する mode を差し替え
-    # ただし、既に初期1が含まれているので「(score - 1)」分だけ加算する
-    for hw, mode, score in rows:
-        if hw in totals and 1 <= int(mode) <= 5:
-            totals[hw] += int(score) - 1
+        if lvl != level:
+            continue
+        if hw not in totals:
+            continue
+        if not (1 <= mode <= 5):
+            continue
+
+        score = int(rec.get("score", 1))
+        totals[hw] += (score - 1)
 
     return totals
 
 
 def mark_grammar_read(level: str, name: str) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT read_count FROM grammar_reads WHERE level=? AND name=?",
-        (level, name),
-    )
-    row = cur.fetchone()
-    if row is None:
-        read_count = 1
-        cur.execute(
-            "INSERT INTO grammar_reads(level, name, read_count, last_read_at) VALUES (?, ?, ?, ?)",
-            (level, name, read_count, now_iso()),
-        )
+    ensure_progress()
+    key = f"{level}|{name}"
+    rec = st.session_state.progress["grammar_reads"].get(key)
+    if rec is None:
+        st.session_state.progress["grammar_reads"][key] = {
+            "read_count": 1,
+            "last_read_at": now_iso(),
+        }
     else:
-        read_count = int(row[0]) + 1
-        cur.execute(
-            "UPDATE grammar_reads SET read_count=?, last_read_at=? WHERE level=? AND name=?",
-            (read_count, now_iso(), level, name),
-        )
-    conn.commit()
-    conn.close()
+        st.session_state.progress["grammar_reads"][key] = {
+            "read_count": int(rec.get("read_count", 0)) + 1,
+            "last_read_at": now_iso(),
+        }
 
 
 def get_grammar_read_stats(level: str, names: list[str]) -> tuple[int, int]:
-    """
-    (read_unique_count, total)
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM grammar_reads WHERE level=?", (level,))
-    read_names = {r[0] for r in cur.fetchall()}
-    conn.close()
+    ensure_progress()
+    read_keys = st.session_state.progress["grammar_reads"].keys()
+    read_names = {k.split("|", 1)[1] for k in read_keys if k.startswith(level + "|")}
     total = len(names)
     read_unique = sum(1 for n in names if n in read_names)
     return read_unique, total
+
+def ensure_progress():
+    if "progress" not in st.session_state:
+        st.session_state.progress = {
+            "word_scores": {},     # key: "level|headword|mode" -> {score, attempts, updated_at}
+            "grammar_reads": {},   # key: "level|name" -> {read_count, last_read_at}
+        }
+
+def export_progress_json() -> str:
+    ensure_progress()
+    payload = {
+        "version": 1,
+        "exported_at": now_iso(),
+        "word_scores": st.session_state.progress["word_scores"],
+        "grammar_reads": st.session_state.progress["grammar_reads"],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+def import_progress_json(text: str) -> None:
+    ensure_progress()
+    data = json.loads(text)
+
+    # ゆるめのバリデーション
+    if "word_scores" not in data or "grammar_reads" not in data:
+        raise ValueError("progress.jsonの形式が違います（word_scores/grammar_readsが見つかりません）")
+
+    st.session_state.progress["word_scores"] = dict(data["word_scores"])
+    st.session_state.progress["grammar_reads"] = dict(data["grammar_reads"])
+
 
 
 # =============================
@@ -322,10 +276,53 @@ def speak_button(text: str, button_label: str = "▶ 再生") -> None:
 # =============================
 # UI
 # =============================
+def flash(msg: str):
+    st.session_state["_flash"] = msg
+
+def show_flash():
+    msg = st.session_state.pop("_flash", None)
+    if msg:
+        st.success(msg)  # これなら画面に残る（toastより確実）
+
 st.set_page_config(page_title="CEFR 英語教材", layout="centered")
-init_db()
 
 st.title("CEFR レベル別 英語教材（単語テスト + 文法）")
+
+show_flash()
+ensure_progress()
+
+if "uploader_nonce" not in st.session_state:
+    st.session_state.uploader_nonce = 0
+
+with st.sidebar:
+    st.header("進捗（読み込み/書き出し）")
+
+    up = st.file_uploader(
+        "progress.json を選択",
+        type=["json"],
+        key=f"progress_uploader_{st.session_state.uploader_nonce}"
+    )
+
+    if st.button("このファイルを読み込む", type="primary"):
+        if up is None:
+            st.warning("まず progress.json を選択してください。")
+        else:
+            try:
+                import_progress_json(up.read().decode("utf-8"))
+                flash("進捗を読み込みました ✅")
+                # uploaderを強制的に空にする（×を押さなくてよくなる）
+                st.session_state.uploader_nonce += 1
+                st.rerun()
+            except Exception as e:
+                st.error(f"読み込み失敗: {e}")
+
+    data = export_progress_json()
+    st.download_button(
+        "進捗を書き出す（progress.json）",
+        data=data,
+        file_name="progress.json",
+        mime="application/json",
+    )
 
 tab_words, tab_grammar = st.tabs(["🧠 単語テスト", "📘 文法"])
 
@@ -453,18 +450,22 @@ with tab_words:
             with c1:
                 if st.button("正解（10）"):
                     set_word_mode_score(level, hw, mode, 10)
-                    st.toast("記録しました ✅")
+                    flash("記録しました ✅")
+                    st.rerun()
             with c2:
                 if st.button("微妙（5）"):
                     set_word_mode_score(level, hw, mode, 5)
-                    st.toast("記録しました ✅")
+                    flash("記録しました ✅")
+                    st.rerun()
             with c3:
                 if st.button("不正解（0）"):
                     set_word_mode_score(level, hw, mode, 0)
-                    st.toast("記録しました ✅")
+                    flash("記録しました ✅")
+                    st.rerun()
             with c4:
                 if st.button("この単語をスキップ（更新なし）"):
-                    st.toast("記録しました ✅")
+                    flash("記録しました ✅")
+                    st.rerun()
 
             # 現在スコアの見える化
             m_scores = []
@@ -501,59 +502,104 @@ with tab_grammar:
     if st.session_state.g_view == "index":
         st.markdown("### 文法インデックス")
 
+        ensure_progress()
+        read_keys = st.session_state.progress["grammar_reads"].keys()
+        read_set = {k.split("|", 1)[1] for k in read_keys if k.startswith(level_g + "|")}
+
+        only_unread = st.checkbox("未読のみ表示", value=False)
         q = st.text_input("検索（タイトルの一部）", "")
+
         show = dfg
         if q.strip():
             show = dfg[dfg["name"].astype(str).str.contains(q, case=False, na=False)]
 
         titles = show["name"].astype(str).tolist()
-        if not titles:
-            st.warning("検索結果がありません。")
-            st.stop()
+        if only_unread:
+            titles = [t for t in titles if t not in read_set]
+
+        # 表示用：読了は ✅ を付ける
+        label_map = {}
+        labeled_titles = []
+        for t in titles:
+            label = f"✅ {t}" if t in read_set else f"⬜ {t}"
+            label_map[label] = t
+            labeled_titles.append(label)
 
         placeholder = "（項目を選んでください）"
-        options = [placeholder] + titles
-        selected = st.selectbox("開く項目", options, index=0, key="grammar_index_select")
+        options = [placeholder] + labeled_titles
+        selected_label = st.selectbox("開く項目", options, index=0, key="grammar_index_select")
+
+        selected = None if selected_label == placeholder else label_map[selected_label]
 
         if st.button("この項目を開く", type="primary", key="grammar_open_btn"):
-            if selected == placeholder:
+            if selected is None:
                 st.warning("項目を選んでから「この項目を開く」を押してください。")
             else:
-                st.session_state.g_idx = int(dfg.index[dfg["name"].astype(str) == selected][0]) + 1
+                new_idx = int(dfg.index[dfg["name"].astype(str) == selected][0]) + 1
+                st.session_state.g_idx = new_idx
+                st.session_state["grammar_number"] = new_idx
                 st.session_state.g_view = "reader"
                 st.rerun()
 
         st.stop()
 
+
     # ----- リーダー -----
     if st.button("⟵ インデックスへ戻る", key="grammar_back_to_index"):
         st.session_state.g_view = "index"
-        st.stop()
+        st.rerun()
 
     n = len(dfg)
-    if n == 0:
-        st.warning("文法データが空です。CSVを確認してください。")
-        st.stop()
 
+    # 初回 or レベル切替時に grammar_number を整える
+    if "grammar_number" not in st.session_state:
+        st.session_state["grammar_number"] = int(st.session_state.g_idx)
+
+    # 範囲外に落ちないよう保険
+    st.session_state["grammar_number"] = max(1, min(n, int(st.session_state["grammar_number"])))
+
+    # ページ送りボタン（grammar_number だけを動かす）
     c_prev, _, c_next = st.columns([1, 2, 1])
     with c_prev:
         if st.button("← 戻る", key="grammar_prev"):
-            st.session_state.g_idx = max(1, st.session_state.g_idx - 1)
+            st.session_state["grammar_number"] = max(1, st.session_state["grammar_number"] - 1)
+            st.rerun()
     with c_next:
         if st.button("次へ →", key="grammar_next"):
-            st.session_state.g_idx = min(n, st.session_state.g_idx + 1)
+            st.session_state["grammar_number"] = min(n, st.session_state["grammar_number"] + 1)
+            st.rerun()
 
-    idx1 = st.number_input("項目番号", min_value=1, max_value=n, value=st.session_state.g_idx, step=1, key="grammar_number")
-    st.session_state.g_idx = int(idx1)
+    # number_input（value=は渡さない / keyで管理）
+    st.number_input(
+        "項目番号",
+        min_value=1, max_value=n,
+        step=1,
+        key="grammar_number",
+    )
 
-    st.caption(f"{st.session_state.g_idx} / {n}")
+    # ★ここで確定：この後は g_idx を読むだけ
+    st.session_state.g_idx = int(st.session_state["grammar_number"])
+
+    # この g_idx で row/title を決める（同期後）
     row = dfg.iloc[st.session_state.g_idx - 1]
-
     title = str(row.get("name", ""))
+
+    ensure_progress()
+    gkey = f"{level_g}|{title}"
+    rec = st.session_state.progress["grammar_reads"].get(gkey)
+    is_read = (rec is not None)
+
+    st.caption(f"{st.session_state.g_idx} / {n}   {'✅読了' if is_read else '⬜未読'}")
+
     summary = str(row.get("summary", ""))
     explanation = str(row.get("explanation", ""))
     original = str(row.get("original", ""))
     translation = str(row.get("translation", ""))
+
+    if rec:
+        st.success(f"✅ 読了（回数: {rec.get('read_count', 1)} / 最終: {rec.get('last_read_at','')}）")
+    else:
+        st.info("📌 未読")
 
     st.subheader(title)
     if summary.strip():
@@ -569,6 +615,9 @@ with tab_grammar:
     st.write("—")
     st.write(translation)
 
-    if st.button("読んだ！", key="grammar_read", type="primary"):
+    # 読んだ！：保存 → その場で rec を引き直して“即反映”
+    if st.button("読んだ！", key=f"grammar_read_{level_g}_{st.session_state.g_idx}", type="primary"):
         mark_grammar_read(level_g, title)
-        st.toast("記録しました ✅")
+        rec = st.session_state.progress["grammar_reads"].get(gkey)
+        st.success("記録しました ✅")
+
